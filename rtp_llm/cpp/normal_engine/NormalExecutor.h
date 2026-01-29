@@ -11,6 +11,8 @@
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
 #include "rtp_llm/cpp/models/lora/LoraManager.h"
 #include "rtp_llm/cpp/models/eplb/ExpertBalancer.h"
+#include "rtp_llm/cpp/devices/cuda_impl/CudaDevice.h"
+
 
 namespace rtp_llm {
 
@@ -24,6 +26,17 @@ public:
                             bool                                       warm_up      = false);
     ~NormalExecutor() {
         device_->profileStop();
+        if (vocab_mask_pinned_ptr != nullptr) {
+            cudaError_t err = cudaFreeHost(vocab_mask_pinned_ptr);
+            if (err != cudaSuccess) {
+                printf("Failed to free pinned memory: %s\n", cudaGetErrorString(err));
+            }
+            vocab_mask_pinned_ptr = nullptr;
+        }
+        cudaError_t err = cudaStreamDestroy(stream_comm);
+        if (err != cudaSuccess) {
+            printf("Failed to destroy stream: %s\n", cudaGetErrorString(err));
+        }
     }
     absl::Status process(const std::list<GenerateStreamPtr>& streams) override;
     void         reportMetrics(const StreamGroups&             stream_groups,
@@ -54,6 +67,9 @@ private:
     MetricsLoopReporter<RtpLLMTokenPSMetrics, RtpLLMTokenPSMetricsCollector> tps_reporter_;
     bool                                                                     enable_ffn_disaggregate_ = false;
     bool                                                                     enable_detail_log_       = false;
+    uint8_t*                                                                 vocab_mask_pinned_ptr = nullptr;
+    int                                                                      MAX_CUDA_MALLOC_SIZE = 0;
+    cudaStream_t                                                             stream_comm;
 };
 
 }  // namespace rtp_llm

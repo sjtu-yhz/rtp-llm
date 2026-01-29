@@ -87,6 +87,18 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                    params
     PrefixToCandidateTokens::instance()->reloadPrefixDictWithPrefix(
         params.gpt_init_parameter.ckpt_path_, params.gpt_init_parameter.sp_config.tree_decode_config);
     device_->profileStart();
+    if (auto* cuda_device_ptr = dynamic_cast<CudaDevice*>(device_)){
+        MAX_CUDA_MALLOC_SIZE = 200*170000;
+        cudaError_t err = cudaMallocHost(&vocab_mask_pinned_ptr, MAX_CUDA_MALLOC_SIZE * sizeof(uint8_t));
+        if (err != cudaSuccess) {
+            throw std::runtime_error("Failed to allocate pinned host memory");
+        }
+    }
+
+    cudaError_t err = cudaStreamCreate(&stream_comm);
+    if (err != cudaSuccess) {
+        printf("Failed to create stream_comm: %s\n", cudaGetErrorString(err));
+    }
 }
 
 absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams) {
@@ -147,6 +159,21 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
         CHECK_AND_RETURN_REF(sampler_input,
                              batch_stream_processor_->gatherSamplerInput(stream_groups, model_input, model_output));
+        /******** logits processor begin ********/
+        if (sampler_input.logits_processor_states_ptr != nullptr) {
+            auto logits_processors_list = sampler_input.logits_processor_states_ptr->logits_processors_;
+            auto intervals_list = sampler_input.logits_processor_states_ptr->intervals_;
+            for (size_t ith = 0; ith < logits_processors_list.size(); ith++) {
+                if (auto* ptr = dynamic_cast<TreeLogitsProcessor*>(logits_processors_list[ith].get())){
+                    ptr->process(sampler_input, intervals_list[ith].first, intervals_list[ith].second,vocab_mask_pinned_ptr);
+                } else if (auto* ptr = dynamic_cast<MultiSeqLogitsProcessor*>(logits_processors_list[ith].get())){
+                    ptr->process(sampler_input, intervals_list[ith].first, intervals_list[ith].second);
+                } else if (auto* ptr = dynamic_cast<ThinkModeLogitsProcessor*>(logits_processors_list[ith].get())){
+                    ptr->process(sampler_input, intervals_list[ith].first, intervals_list[ith].second);
+                }
+            }
+        }
+        /******** logits processor end ********/
         sampler_output = std::move(sampler_->forward(sampler_input));
         RTP_LLM_LOG_DEBUG("sampler forward done");
         executor_collector.sample_input_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;

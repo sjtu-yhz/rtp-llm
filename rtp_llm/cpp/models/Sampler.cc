@@ -29,7 +29,7 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
     autil::ScopeGuard guard_##buffer([&]() { buffer.updateShape(org_##buffer##_shape__); });                           \
     buffer.updateShape(__VA_ARGS__);
 
-    preprocessLogits(inputs);
+    //preprocessLogits(inputs);
 
     uint64_t max_seq_len   = inputs.token_ids->shape()[1];
     auto     num_beams_in  = inputs.num_beams_in->data<uint64_t>();
@@ -188,10 +188,10 @@ SamplerOutput Sampler::forward(const SamplerInputs& inputs) {
                           std::move(all_success)});
 }
 
-void Sampler::preprocessLogits(const SamplerInputs& inputs) {
-    if (inputs.logits_processor_states_ptr != nullptr) {
-        inputs.logits_processor_states_ptr->batchProcess(inputs);
-    }
-}
+// void Sampler::preprocessLogits(const SamplerInputs& inputs) {
+//     if (inputs.logits_processor_states_ptr != nullptr) {
+//         inputs.logits_processor_states_ptr->batchProcess(inputs);
+//     }
+// }
 
 }  // namespace rtp_llm

@@ -51,8 +51,13 @@ public:
 
 public:
     void process(const SamplerInputs& inputs, size_t start_idx, size_t finish_idx) override;
+    void process(const SamplerInputs& inputs, size_t start_idx, size_t finish_idx,uint8_t* vocab_mask_pinned);
     void updateMultiSeqStatus(const std::vector<int>& src_batch_indices) override;
     void updateStatus(const rtp_llm::BufferPtr& new_tokens, int32_t num_new_tokens) override;
+    rtp_llm::BufferPtr generateVocabMask(
+    size_t batch_size, size_t vocab_size, const std::vector<std::vector<size_t>>& batch_candidate_token_ids);
+    rtp_llm::BufferPtr generateVocabMask(
+    size_t batch_size, size_t vocab_size, const std::vector<std::vector<size_t>>& batch_candidate_token_ids,uint8_t* vocab_mask_pinned);
 
 public:
     std::vector<std::string> getStatus();
