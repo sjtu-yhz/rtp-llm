@@ -12,12 +12,12 @@ using namespace std;
 
 namespace rtp_llm {
 
-NormalExecutor::NormalExecutor(const EngineInitParams&                    params,
-                               const std::shared_ptr<CacheManager>&       cache_manager,
-                               rtp_llm::DeviceBase*                       device,
+NormalExecutor::NormalExecutor(const EngineInitParams&                   params,
+                               const std::shared_ptr<CacheManager>&      cache_manager,
+                               rtp_llm::DeviceBase*                      device,
                                std::shared_ptr<autil::LockFreeThreadPool> thread_pool,
-                               const std::shared_ptr<lora::LoraManager>&  lora_manager,
-                               bool                                       warm_up):
+                               const std::shared_ptr<lora::LoraManager>& lora_manager,
+                               bool                                      warm_up):
     Executor(device),
     cache_manager_(cache_manager),
     lora_manager_(lora_manager),
@@ -135,6 +135,18 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         model_input.lora_model_input =
             lora_manager_->makeLoraModelInput(model_input.lora_ids, model_input.lora_input_lengths);
     }
+    //*********** get LogitsProcessorStatesPtr begin ************//
+    LogitsProcessorStatesPtr state_ptr = std::make_shared<LogitsProcessorStates>();
+    auto all_streams          = stream_groups.allStreams();
+    std::for_each(all_streams.begin(), all_streams.end(), [&state_ptr, idx = 0](auto& stream) mutable {
+        for (const auto& processor : stream->getAllLogitsProcessorPtr()) {
+            state_ptr->insert(processor, idx, idx + stream->currentBatchSize());
+        }
+        idx += stream->currentBatchSize();
+    });
+    bool need_process=false;
+    size_t  bs;
+    //*********** get LogitsProcessorStatesPtr end ************//
     {
         bool force = device_->getDeviceProperties().tp_rank == 0 && enable_detail_log_;
         if (force) {
@@ -143,7 +155,31 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
             RTP_LLM_LOG_TRACE("model_input: %s", model_input.debugString(force).c_str());
         }
         int64_t start_time_us               = autil::TimeUtility::currentTimeInMicroSeconds();
-        model_output                        = std::move(model_->forward(model_input));
+        model_->forward_one_stage(model_input);
+        if (state_ptr != nullptr) {
+            auto logits_processors_ori = state_ptr->logits_processors_;
+            auto intervals_ori = state_ptr->intervals_;
+            for (size_t k = 0; k < logits_processors_ori.size(); k++) {
+                if (auto* ptr_ori = dynamic_cast<TreeLogitsProcessor*>(logits_processors_ori[k].get())) {
+                    std::vector<std::vector<size_t>> batch_candidate_token_ids =ptr_ori->getCandidateTokenIds(intervals_ori[k].first, intervals_ori[k].second);                   
+                    for (size_t kth = 0; kth < ptr_ori->size(); ++kth) {
+                        if (batch_candidate_token_ids[kth].size() > 0) {
+                            need_process = true;
+                            break; // Early exit when we find at least one non-empty candidate token list
+                        }
+                    }
+                    if (need_process){
+                        // Will be initialized after model forward pass with correct vocab_size
+                        size_t vocab_size=31872; 
+                        bs = ptr_ori->size();
+                        ptr_ori->generateVocabMask(ptr_ori->size(), vocab_size, batch_candidate_token_ids,stream_comm,vocab_mask_pinned_ptr);
+                    }
+                }
+            }
+        }
+        model_->forward_two_stage(model_input);
+        model_output = std::move(model_->forward_three_stage(model_input));
+        //model_output                        = std::move(model_->forward(model_input));
         executor_collector.model_forward_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
         RTP_LLM_LOG_DEBUG("model forward done");
     }
@@ -159,16 +195,28 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
         CHECK_AND_RETURN_REF(sampler_input,
                              batch_stream_processor_->gatherSamplerInput(stream_groups, model_input, model_output));
+
+        // Initialize vocab_size from sampler input logits shape
+        size_t vocab_size = 0;
+        if (sampler_input.logits != nullptr && sampler_input.logits->shape().size() > 1) {
+            vocab_size = sampler_input.logits->shape()[1];
+        }
+        int64_t sample_start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
         /******** logits processor begin ********/
         if (sampler_input.logits_processor_states_ptr != nullptr) {
+            // sampler_input.logits_processor_states_ptr->batchProcess(sampler_input);
             auto logits_processors_list = sampler_input.logits_processor_states_ptr->logits_processors_;
             auto intervals_list = sampler_input.logits_processor_states_ptr->intervals_;
             for (size_t ith = 0; ith < logits_processors_list.size(); ith++) {
-                if (auto* ptr = dynamic_cast<TreeLogitsProcessor*>(logits_processors_list[ith].get())){
-                    ptr->process(sampler_input, intervals_list[ith].first, intervals_list[ith].second,vocab_mask_pinned_ptr);
-                } else if (auto* ptr = dynamic_cast<MultiSeqLogitsProcessor*>(logits_processors_list[ith].get())){
-                    ptr->process(sampler_input, intervals_list[ith].first, intervals_list[ith].second);
+                if (auto* ptr = dynamic_cast<TreeLogitsProcessor*>(logits_processors_list[ith].get())) {
+                    if (need_process && ptr->batch_vocab_mask != nullptr){
+                       auto batch_logits = sampler_input.logits->slice(intervals_list[ith].first, intervals_list[ith].second);
+                        ptr->maskLogits(batch_logits,ptr->batch_vocab_mask);  
+                    }
+                    //ptr->process(sampler_input, intervals_list[ith].first, intervals_list[ith].second,vocab_mask_pinned_ptr);
                 } else if (auto* ptr = dynamic_cast<ThinkModeLogitsProcessor*>(logits_processors_list[ith].get())){
+                    ptr->process(sampler_input, intervals_list[ith].first, intervals_list[ith].second);
+                } else if (auto* ptr = dynamic_cast<MultiSeqLogitsProcessor*>(logits_processors_list[ith].get())){
                     ptr->process(sampler_input, intervals_list[ith].first, intervals_list[ith].second);
                 }
             }

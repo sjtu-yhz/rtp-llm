@@ -1662,6 +1662,79 @@ GptModelOutputs GptModel::forward(const GptModelInputs& inputs) {
     return outputs;
 }
 
+void GptModel::forward_one_stage(const GptModelInputs& inputs){   
+    DevicePerfWrapper wrapper(device_, "forward [tp=%d, dp=%d]", device_props_.tp_size, device_props_.dp_size);
+    cleanExpertStats();
+    auto layer_inputs = forwardPreLayers(inputs);
+    forward_layer_inputs_ = std::make_shared<GptLayerInputs>(std::move(layer_inputs));
+
+    eagle3_selected_hidden_.clear();
+    moe_gating_.clear();
+    if (inputs.need_moe_gating) {
+        moe_gating_.reserve(layer_num_);
+    }
+    if (int(device_props_.enable_layer_micro_batch) && forward_layer_inputs_->micro_batch_inputs.size() > 0) {
+        // TODO(zhangjianning.zjn) support return moe_gating in micro batch
+        auto layer_outputs = forwardMicroBatchedLayers(*forward_layer_inputs_, inputs, eagle3_selected_hidden_);
+        forward_layer_outputs_ = std::make_shared<GptLayerOutputs>(std::move(layer_outputs));
+        // RTP_LLM_LOG_INFO("yhz_test_info:use forwardMicroBatchedLayers");
+    } else {
+        forward_layer_inputs_->need_moe_gating = inputs.need_moe_gating;
+        //for (int32_t i = 0; i < layer_num_; ++i) {
+            // RTP_LLM_LOG_INFO("yhz_test_info:use forwardGptLayer");
+            auto layer_outputs                     = forwardGptLayer(*forward_layer_inputs_, 0, inputs.lora_model_input);
+            forward_layer_outputs_ = std::make_shared<GptLayerOutputs>(std::move(layer_outputs));
+            forward_layer_inputs_->hidden               = forward_layer_outputs_->hidden;
+            forward_layer_inputs_->pre_decoder_residual = forward_layer_outputs_->pre_decoder_residual;
+            if (inputs.need_moe_gating) {
+                moe_gating_.push_back(std::move(forward_layer_outputs_->moe_gating));
+            }
+            if (dynamic_cast<Eagle3Model*>(this) == nullptr && device_props_.is_eagle3
+                && device_props_.eagle3_selected_layer.count(0) > 0) {
+                eagle3_selected_hidden_.push_back(device_->clone({*forward_layer_inputs_->hidden, AllocationType::DEVICE}));
+            }
+        //}
+    }
+}
+
+void GptModel::forward_two_stage(const GptModelInputs& inputs){   
+    if (!(int(device_props_.enable_layer_micro_batch) && forward_layer_inputs_->micro_batch_inputs.size() > 0)) {
+        for (int32_t i = 1; i < layer_num_; ++i) {
+            // RTP_LLM_LOG_INFO("yhz_test_info:use forwardGptLayer");
+            auto layer_outputs                     = forwardGptLayer(*forward_layer_inputs_, i, inputs.lora_model_input);
+            forward_layer_outputs_ = std::make_shared<GptLayerOutputs>(std::move(layer_outputs));
+            forward_layer_inputs_->hidden               = forward_layer_outputs_->hidden;
+            forward_layer_inputs_->pre_decoder_residual = forward_layer_outputs_->pre_decoder_residual;
+            if (inputs.need_moe_gating) {
+                moe_gating_.push_back(std::move(forward_layer_outputs_->moe_gating));
+            }
+            if (dynamic_cast<Eagle3Model*>(this) == nullptr && device_props_.is_eagle3
+                && device_props_.eagle3_selected_layer.count(i) > 0) {
+                eagle3_selected_hidden_.push_back(device_->clone({*forward_layer_inputs_->hidden, AllocationType::DEVICE}));
+            }
+        }
+    }
+}
+
+GptModelOutputs GptModel::forward_three_stage(const GptModelInputs& inputs) {
+    BufferPtr merged_eagle3_hidden = mergeEagle3HiddenState(*forward_layer_inputs_, eagle3_selected_hidden_);
+
+    auto outputs = forwardPostLayers(forward_layer_outputs_->hidden,
+                                     inputs.input_lengths->shape()[0] != inputs.sequence_lengths->shape()[0],
+                                     inputs.need_all_logits,
+                                     inputs.lm_output_indexes,
+                                     forward_layer_inputs_->enable_sp,
+                                     forward_layer_inputs_->token_num,
+                                     inputs,
+                                     merged_eagle3_hidden);
+
+    // make sure cpu buffers out lives gpu exec
+    outputs.captured_values = forward_layer_inputs_;
+    outputs.moe_gating      = std::move(moe_gating_);
+    return outputs;
+}
+
+
 void GptModel::prepareExpertStats(const size_t layer_id, rtp_llm::FfnLayerParams& ffn_layer_params) {
     OptionalExpertStats layer_expert_stats = nullopt;
     if (overall_expert_stats_.log_exp_num != 0) {

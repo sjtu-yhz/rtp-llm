@@ -1,7 +1,6 @@
 #pragma once
 
 #include <memory>
-#include "autil/LockFreeThreadPool.h"
 #include "kmonitor/client/MetricsReporter.h"
 #include "rtp_llm/cpp/engine_base/Executor.h"
 #include "rtp_llm/cpp/engine_base/EngineInitParams.h"
@@ -13,17 +12,15 @@
 #include "rtp_llm/cpp/models/eplb/ExpertBalancer.h"
 #include "rtp_llm/cpp/devices/cuda_impl/CudaDevice.h"
 
-
 namespace rtp_llm {
 
 class NormalExecutor: public Executor {
 public:
-    explicit NormalExecutor(const EngineInitParams&                    params,
-                            const std::shared_ptr<CacheManager>&       cache_manager,
-                            rtp_llm::DeviceBase*                       device,
-                            std::shared_ptr<autil::LockFreeThreadPool> thread_pool,
-                            const std::shared_ptr<lora::LoraManager>&  lora_manager = nullptr,
-                            bool                                       warm_up      = false);
+    explicit NormalExecutor(const EngineInitParams&                   params,
+                            const std::shared_ptr<CacheManager>&      cache_manager,
+                            rtp_llm::DeviceBase*                      device,
+                            const std::shared_ptr<lora::LoraManager>& lora_manager = nullptr,
+                            bool                                      warm_up      = false);
     ~NormalExecutor() {
         device_->profileStop();
         if (vocab_mask_pinned_ptr != nullptr) {
@@ -60,7 +57,6 @@ private:
     std::shared_ptr<CacheManager>                                            cache_manager_;
     std::shared_ptr<lora::LoraManager>                                       lora_manager_;
     std::shared_ptr<ExpertBalancer>                                          expert_balancer_;
-    std::shared_ptr<autil::LockFreeThreadPool>                               thread_pool_;
     bool                                                                     warm_up_;
     bool                                                                     use_all_gather_;
     kmonitor::MetricsReporterPtr                                             metrics_reporter_ = nullptr;

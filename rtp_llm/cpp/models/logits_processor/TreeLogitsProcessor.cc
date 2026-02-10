@@ -10,39 +10,83 @@ TreeLogitsProcessor::TreeLogitsProcessor(rtp_llm::DeviceBase* device): BaseLogit
 TreeLogitsProcessor::TreeLogitsProcessor(rtp_llm::DeviceBase* device, std::vector<StreamTreeInfo> tree_infos):
     BaseLogitsProcessor(device), tree_infos_(tree_infos) {}
 
-void TreeLogitsProcessor::process(const SamplerInputs& inputs, size_t start_idx, size_t finish_idx,uint8_t* vocab_mask_pinned) {
-    auto batch_size = size();
-    RTP_LLM_CHECK(batch_size == finish_idx - start_idx);
-    bool                             need_process = false;
-    std::vector<std::vector<size_t>> batch_candidate_token_ids(batch_size);
+void TreeLogitsProcessor::generateVocabMask(
+    size_t batch_size, size_t vocab_size, const std::vector<std::vector<size_t>>& batch_candidate_token_ids,cudaStream_t& stream,uint8_t* vocab_mask_pinned) {
+    RTP_LLM_CHECK(batch_candidate_token_ids.size() == batch_size);
+    std::fill(vocab_mask_pinned, vocab_mask_pinned + batch_size * vocab_size, 1);
 
-    for (size_t i = 0; i < size(); ++i) {
-        auto& info = tree_infos_[i];
-        if (!info.in_tree_mode) {
-            continue;
-        }
-        
-        // 【新增】如果即将到达终止状态，提前退出树模式
-        if (info.dfa_ptr->isAboutToFinish()) {
-            info.in_tree_mode = false;
-            continue;
-        }
-
-        const auto& candidate_token_ids = info.dfa_ptr->getCandidateTokenIds();
-        batch_candidate_token_ids[i]    = candidate_token_ids;
-        if (candidate_token_ids.size() > 0) {
-            need_process = true;
+    for (size_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        const auto& candidate_token_ids = batch_candidate_token_ids[batch_idx];
+        for (const auto& token_id : candidate_token_ids) {
+            if (token_id < vocab_size) {
+                vocab_mask_pinned[batch_idx * vocab_size + token_id] = 0;
+            }
         }
     }
-    // If no beams need processing, return early
-    if (!need_process) {
-        return;
+
+    BufferPtr host_buffer = std::make_shared<Buffer>(
+        MemoryType::MEMORY_CPU_PINNED,
+        DataType::TYPE_UINT8,
+        std::vector<size_t>{batch_size * vocab_size},
+        vocab_mask_pinned,
+        nullptr
+    );
+    auto buffer_reshape = host_buffer->reshape({batch_size, vocab_size});
+    //BufferPtr vocab_mask_buffer_cpu = vector2Buffer(vocab_mask_cpu);
+    //auto      buffer_reshape        = vocab_mask_buffer_cpu->reshape({batch_size, vocab_size});
+    //return device_->clone({buffer_reshape, rtp_llm::AllocationType::DEVICE});
+    if (auto* cuda_device_ptr = dynamic_cast<CudaDevice*>(device_)){
+        CloneParams clone_params={buffer_reshape, rtp_llm::AllocationType::DEVICE};
+        auto dst = cuda_device_ptr->allocateBufferLike(clone_params.input, clone_params.alloc_type, clone_params.hints);
+        CopyParams copy_params={*dst, clone_params.input, clone_params.overlapped, DeviceStream::DEFAULT, clone_params.async};
+
+        copy_params.check();
+        const auto& copy_src = copy_params.src;
+        const auto& copy_dst = copy_params.dst;
+        cudaMemcpyKind copyType = cudaMemcpyHostToDevice;
+        cudaMemcpyAsync(copy_dst.data(), copy_src.data(), copy_src.sizeBytes(), copyType, stream);
+        check_cuda_error();
+        // device_->noBlockCopy(copy_params);
+        batch_vocab_mask = dst;
+    } else {
+        batch_vocab_mask = device_->clone({buffer_reshape, rtp_llm::AllocationType::DEVICE});
     }
-    auto   batch_logits     = inputs.logits->slice(start_idx, batch_size);
-    size_t vocab_size       = batch_logits->shape()[1];
-    auto   batch_vocab_mask = generateVocabMask(batch_size, vocab_size, batch_candidate_token_ids,vocab_mask_pinned);
-    maskLogits(batch_logits, batch_vocab_mask);
+
 }
+
+// void TreeLogitsProcessor::process(const SamplerInputs& inputs, size_t start_idx, size_t finish_idx,uint8_t* vocab_mask_pinned) {
+//     auto batch_size = size();
+//     RTP_LLM_CHECK(batch_size == finish_idx - start_idx);
+//     bool                             need_process = false;
+//     std::vector<std::vector<size_t>> batch_candidate_token_ids(batch_size);
+
+//     for (size_t i = 0; i < size(); ++i) {
+//         auto& info = tree_infos_[i];
+//         if (!info.in_tree_mode) {
+//             continue;
+//         }
+        
+//         // 【新增】如果即将到达终止状态，提前退出树模式
+//         if (info.dfa_ptr->isAboutToFinish()) {
+//             info.in_tree_mode = false;
+//             continue;
+//         }
+
+//         const auto& candidate_token_ids = info.dfa_ptr->getCandidateTokenIds();
+//         batch_candidate_token_ids[i]    = candidate_token_ids;
+//         if (candidate_token_ids.size() > 0) {
+//             need_process = true;
+//         }
+//     }
+//     // If no beams need processing, return early
+//     if (!need_process) {
+//         return;
+//     }
+//     auto   batch_logits     = inputs.logits->slice(start_idx, batch_size);
+//     size_t vocab_size       = batch_logits->shape()[1];
+//     auto   batch_vocab_mask = generateVocabMask(batch_size, vocab_size, batch_candidate_token_ids,vocab_mask_pinned);
+//     maskLogits(batch_logits, batch_vocab_mask);
+// }
 
 void TreeLogitsProcessor::process(const SamplerInputs& inputs, size_t start_idx, size_t finish_idx) {
     auto batch_size = size();
@@ -75,34 +119,6 @@ void TreeLogitsProcessor::process(const SamplerInputs& inputs, size_t start_idx,
     size_t vocab_size       = batch_logits->shape()[1];
     auto   batch_vocab_mask = generateVocabMask(batch_size, vocab_size, batch_candidate_token_ids);
     maskLogits(batch_logits, batch_vocab_mask);
-}
-
-
-rtp_llm::BufferPtr TreeLogitsProcessor::generateVocabMask(
-    size_t batch_size, size_t vocab_size, const std::vector<std::vector<size_t>>& batch_candidate_token_ids,uint8_t* vocab_mask_pinned) {
-    RTP_LLM_CHECK(batch_candidate_token_ids.size() == batch_size);
-    std::fill(vocab_mask_pinned, vocab_mask_pinned + batch_size * vocab_size, 1);
-
-    for (size_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
-        const auto& candidate_token_ids = batch_candidate_token_ids[batch_idx];
-        for (const auto& token_id : candidate_token_ids) {
-            if (token_id < vocab_size) {
-                vocab_mask_pinned[batch_idx * vocab_size + token_id] = 0;
-            }
-        }
-    }
-
-    BufferPtr host_buffer = std::make_shared<Buffer>(
-        MemoryType::MEMORY_CPU_PINNED,
-        DataType::TYPE_UINT8,
-        std::vector<size_t>{batch_size * vocab_size},
-        vocab_mask_pinned,
-        nullptr
-    );
-    auto buffer_reshape = host_buffer->reshape({batch_size, vocab_size});
-    //BufferPtr vocab_mask_buffer_cpu = vector2Buffer(vocab_mask_cpu);
-    //auto      buffer_reshape        = vocab_mask_buffer_cpu->reshape({batch_size, vocab_size});
-    return device_->clone({buffer_reshape, rtp_llm::AllocationType::DEVICE});
 }
 
 rtp_llm::BufferPtr TreeLogitsProcessor::generateVocabMask(
@@ -187,6 +203,23 @@ void TreeLogitsProcessor::updateStatus(const rtp_llm::BufferPtr& new_tokens, int
             info.in_tree_mode = false;
         }
     }
+}
+
+std::vector<std::vector<size_t>> TreeLogitsProcessor::getCandidateTokenIds(size_t start_idx, size_t finish_idx) {
+    auto batch_size = size();
+    RTP_LLM_CHECK(batch_size == finish_idx - start_idx);
+    std::vector<std::vector<size_t>> batch_candidate_token_ids(batch_size);
+
+    for (size_t i = 0; i < size(); ++i) {
+        auto& info = tree_infos_[i];
+        if (!info.in_tree_mode) {
+            continue;
+        }
+        const auto& candidate_token_ids = info.dfa_ptr->getCandidateTokenIds();
+        batch_candidate_token_ids[i]    = candidate_token_ids;
+    }
+    // If no beams need processing, return early
+    return batch_candidate_token_ids;
 }
 
 TreeLogitsProcessorPtr TreeLogitsProcessor::fromGenerateInput(rtp_llm::DeviceBase*           device,

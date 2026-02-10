@@ -3,6 +3,7 @@
 #include "rtp_llm/cpp/models/logits_processor/BaseLogitsProcessor.h"
 #include "rtp_llm/cpp/models/logits_processor/DFAUtil.h"
 
+#include "rtp_llm/cpp/devices/cuda_impl/CudaDevice.h"
 namespace rtp_llm {
 
 struct StreamTreeInfo {
@@ -11,14 +12,14 @@ struct StreamTreeInfo {
     int32_t                                    current_output_length;
     bool                                       is_beam_search;
     std::shared_ptr<TreeDFA<std::string, int>> dfa_ptr;
-    bool                                       soft_constraint_mode;
+    bool                                       soft_constraint_mode;  // Enable graceful exit on invalid tokens
     StreamTreeInfo() = default;
     StreamTreeInfo(bool                                       in_tree_mode,
                    int32_t                                    input_length,
                    int32_t                                    output_length,
                    bool                                       is_beam_search,
                    std::shared_ptr<TreeDFA<std::string, int>> dfa_ptr,
-                   bool                                       soft_constraint_mode = true):
+                   bool                                       soft_constraint_mode = false):
         in_tree_mode(in_tree_mode),
         input_length(input_length),
         current_output_length(output_length),
@@ -51,14 +52,13 @@ public:
 
 public:
     void process(const SamplerInputs& inputs, size_t start_idx, size_t finish_idx) override;
-    void process(const SamplerInputs& inputs, size_t start_idx, size_t finish_idx,uint8_t* vocab_mask_pinned);
+    //void process(const SamplerInputs& inputs, size_t start_idx, size_t finish_idx,uint8_t* vocab_mask_pinned);
     void updateMultiSeqStatus(const std::vector<int>& src_batch_indices) override;
     void updateStatus(const rtp_llm::BufferPtr& new_tokens, int32_t num_new_tokens) override;
     rtp_llm::BufferPtr generateVocabMask(
     size_t batch_size, size_t vocab_size, const std::vector<std::vector<size_t>>& batch_candidate_token_ids);
-    rtp_llm::BufferPtr generateVocabMask(
-    size_t batch_size, size_t vocab_size, const std::vector<std::vector<size_t>>& batch_candidate_token_ids,uint8_t* vocab_mask_pinned);
-
+    void generateVocabMask(size_t batch_size, size_t vocab_size, const std::vector<std::vector<size_t>>& batch_candidate_token_ids,cudaStream_t& stream,uint8_t* vocab_mask_pinned);
+    std::vector<std::vector<size_t>> getCandidateTokenIds(size_t start_idx, size_t finish_idx);
 public:
     std::vector<std::string> getStatus();
     size_t                   size() {
@@ -69,7 +69,7 @@ public:
             tree_infos_.insert(tree_infos_.end(), others->tree_infos_.begin(), others->tree_infos_.end());
         }
     }
-
+    rtp_llm::BufferPtr batch_vocab_mask;
 private:
     std::vector<StreamTreeInfo> tree_infos_;
 };

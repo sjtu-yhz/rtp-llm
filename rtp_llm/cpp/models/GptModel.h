@@ -154,7 +154,9 @@ public:
     virtual ~GptModel() {};
 
     virtual GptModelOutputs forward(const GptModelInputs& inputs);
-
+    void forward_one_stage(const GptModelInputs& inputs);
+    void forward_two_stage(const GptModelInputs& inputs);
+    GptModelOutputs forward_three_stage(const GptModelInputs& inputs);
 protected:
     rtp_llm::AttentionCommonInputs prepareAttentionInputs(const GptModelInputs& inputs,
                                                           rtp_llm::DataType     attn_dtype,
@@ -234,7 +236,10 @@ protected:
     rtp_llm::BufferPtr              v_scale_buffer_;
     rtp_llm::BufferPtr              residual_scale_fp32_;
     rtp_llm::BufferPtr              residual_scale_;
-
+    std::shared_ptr<GptLayerOutputs>          forward_layer_outputs_;
+    std::shared_ptr<GptLayerInputs>           forward_layer_inputs_;
+    std::vector<BufferPtr>                    eagle3_selected_hidden_;
+    std::vector<BufferPtr>                    moe_gating_;
 public:
     rtp_llm::Weights            weights_;
     rtp_llm::OverallExpertStats overall_expert_stats_;
