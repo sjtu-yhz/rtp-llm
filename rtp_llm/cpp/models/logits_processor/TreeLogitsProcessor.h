@@ -70,7 +70,7 @@ public:
         }
     }
     rtp_llm::BufferPtr batch_vocab_mask;
-private:
+public:
     std::vector<StreamTreeInfo> tree_infos_;
 };
 typedef std::shared_ptr<TreeLogitsProcessor> TreeLogitsProcessorPtr;

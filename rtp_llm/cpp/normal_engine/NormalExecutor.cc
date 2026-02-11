@@ -161,6 +161,15 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
             auto intervals_ori = state_ptr->intervals_;
             for (size_t k = 0; k < logits_processors_ori.size(); k++) {
                 if (auto* ptr_ori = dynamic_cast<TreeLogitsProcessor*>(logits_processors_ori[k].get())) {
+                    auto& info = ptr_ori->tree_infos_[k];
+                    if (!info.in_tree_mode) {
+                        continue;
+                    }
+                    // 【新增】如果即将到达终止状态，提前退出树模式
+                    if (info.dfa_ptr->isAboutToFinish()) {
+                        info.in_tree_mode = false;
+                        continue;
+                    }
                     std::vector<std::vector<size_t>> batch_candidate_token_ids =ptr_ori->getCandidateTokenIds(intervals_ori[k].first, intervals_ori[k].second);                   
                     for (size_t kth = 0; kth < ptr_ori->size(); ++kth) {
                         if (batch_candidate_token_ids[kth].size() > 0) {
